@@ -22,10 +22,10 @@ type (
 type SocketState uint32
 
 const (
-	StateConnecting    SocketState = iota // 未连接状态，正在建立连接中
-	StateOpen                             // 已建立连接并且可以读取数据
-	SocketStateClosing                    // 连接正在关闭
-	SocketStateClosed                     // 连接已关闭或者没有链接成功
+	SocketStateConnecting SocketState = iota // 未连接状态，正在建立连接中
+	SocketStateOpen                          // 已建立连接并且可以读取数据
+	SocketStateClosing                       // 连接正在关闭
+	SocketStateClosed                        // 连接已关闭或者没有链接成功
 )
 
 type SocketConfig struct {
@@ -54,6 +54,8 @@ type SocketDialer struct {
 	downfun     context.CancelFunc
 	conn        net.Conn
 	state       uint32
+	currretry   int           // 重试次数
+	currdelay   time.Duration // 重试延时
 }
 
 func NewSocketDialer(config SocketConfig, opts ...SocketDialerOptions) *SocketDialer {
@@ -87,7 +89,7 @@ func (sd *SocketDialer) SetCloseFunc(f OnCloseFunc) *SocketDialer {
 	return sd
 }
 
-func (sd *SocketDialer) SetRecvFunc(f OnReadFunc) *SocketDialer {
+func (sd *SocketDialer) SetReadFunc(f OnReadFunc) *SocketDialer {
 	sd.onReadFunc = f
 	return sd
 }
@@ -109,37 +111,16 @@ func (sd *SocketDialer) Serve() {
 	assert(sd.onCloseFunc, "'onCloseFunc' is required")
 	sd.config.ReadTimeout = sd.incr(sd.config.ReadTimeout, time.Second, time.Second*10)
 	sd.config.RetryDelay = sd.incr(sd.config.RetryDelay, time.Second, time.Second*5)
-	var retries int
-	var delay time.Duration
-	reset := func(newconn net.Conn) {
-		if sd.conn != nil {
-			_ = sd.conn.Close()
-		}
-		sd.conn = newconn
-		retries = 0
-		delay = time.Millisecond * 5
-	}
-	reconnect := func() {
-		if sd.config.RetryMax > 0 && retries >= sd.config.RetryMax {
-			sd.setState(SocketStateClosing)
-		} else {
-			retries++
-			sd.ResetState()
-			time.Sleep(sd.config.RetryDelay)
-		}
-	}
-	retry := func(err error) {
+
+	tryErrors := func(err error) {
 		select {
 		case <-sd.downctx.Done():
 			sd.setState(SocketStateClosing)
 		default:
-			// next
-		}
-		if errors.Is(err, io.EOF) {
-			reconnect()
-		}
-		if sd.onErrorFunc(sd, err) {
-			reconnect()
+			continued := errors.Is(err, io.EOF) || sd.onErrorFunc(sd, err)
+			if continued {
+				sd.onTryReconnect()
+			}
 		}
 	}
 	defer sd.Close()
@@ -154,27 +135,27 @@ func (sd *SocketDialer) Serve() {
 		switch SocketState(atomic.LoadUint32(&sd.state)) {
 		case SocketStateClosing, SocketStateClosed:
 			return
-		case StateConnecting:
-			if conn, err := sd.onDialFunc(sd.config); err != nil {
-				retry(fmt.Errorf("connection dial: %w", err))
-			} else if err = sd.onOpenFunc(conn, sd.config); err != nil {
-				retry(fmt.Errorf("connection open: %w", err))
+		case SocketStateConnecting:
+			if newConn, err := sd.onDialFunc(sd.config); err != nil {
+				tryErrors(fmt.Errorf("connection dial: %w", err))
+			} else if err = sd.onOpenFunc(newConn, sd.config); err != nil {
+				tryErrors(fmt.Errorf("connection open: %w", err))
 			} else {
-				reset(conn)
-				sd.setState(StateOpen)
+				sd.onNewConn(newConn)
+				sd.setState(SocketStateOpen)
 			}
-		case StateOpen:
+		case SocketStateOpen:
 			if err := sd.conn.SetReadDeadline(time.Now().Add(sd.config.ReadTimeout)); err != nil {
-				retry(fmt.Errorf("connection set read options: %w", err))
+				tryErrors(fmt.Errorf("connection set read options: %w", err))
 			} else if err = sd.onReadFunc(sd.conn); err != nil {
 				var terr = err
 				if werr := errors.Unwrap(err); werr != nil {
 					terr = werr
 				}
 				if nerr, ok := terr.(net.Error); ok && (nerr.Temporary() || nerr.Timeout()) {
-					time.Sleep(sd.incr(delay, time.Millisecond*5, time.Millisecond*100))
+					time.Sleep(sd.incr(sd.currdelay, time.Millisecond*5, time.Millisecond*100))
 				} else {
-					retry(err)
+					tryErrors(err)
 				}
 			}
 		}
@@ -194,7 +175,7 @@ func (sd *SocketDialer) Close() {
 }
 
 func (sd *SocketDialer) ResetState() {
-	sd.setState(StateConnecting)
+	sd.setState(SocketStateConnecting)
 }
 
 func (sd *SocketDialer) setState(s SocketState) {
@@ -202,6 +183,25 @@ func (sd *SocketDialer) setState(s SocketState) {
 		_ = sd.conn.SetDeadline(time.Time{})
 	}
 	atomic.StoreUint32(&sd.state, uint32(s))
+}
+
+func (sd *SocketDialer) onNewConn(newconn net.Conn) {
+	if sd.conn != nil {
+		_ = sd.conn.Close()
+	}
+	sd.conn = newconn
+	sd.currretry = 0
+	sd.currdelay = time.Millisecond * 5
+}
+
+func (sd *SocketDialer) onTryReconnect() {
+	if sd.config.RetryMax > 0 && sd.currretry >= sd.config.RetryMax {
+		sd.setState(SocketStateClosing)
+	} else {
+		sd.currretry++
+		sd.setState(SocketStateConnecting)
+		time.Sleep(sd.config.RetryDelay)
+	}
 }
 
 func (sd *SocketDialer) close0() {
